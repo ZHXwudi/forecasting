@@ -2,19 +2,30 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
 
 import numpy as np
 import pandas as pd
 
 
 HOURS_PER_YEAR = 8760
+MODEL_SEASONAL_NAIVE = "年度同小时基准模型"
+MODEL_CALENDAR_PROFILE = "日历画像中位数模型"
+MODEL_RECENT_ADJUSTED = "近期修正季节模型"
+MODEL_RIDGE = "岭回归自回归模型"
+MODEL_ENSEMBLE = "最优加权集成模型"
 BASE_MODEL_NAMES = [
-    "Seasonal naive",
-    "Calendar profile",
-    "Recent adjusted seasonal",
-    "Ridge autoregression",
+    MODEL_SEASONAL_NAIVE,
+    MODEL_CALENDAR_PROFILE,
+    MODEL_RECENT_ADJUSTED,
+    MODEL_RIDGE,
 ]
+MODEL_DESCRIPTIONS = {
+    MODEL_SEASONAL_NAIVE: "用上一年同一日期、同一小时的电价作为预测值，适合年度季节性很强、规律重复明显的数据。",
+    MODEL_CALENDAR_PROFILE: "按月份、星期几和小时统计历史电价中位数，形成典型日历画像，再用相同日历特征预测未来。",
+    MODEL_RECENT_ADJUSTED: "先沿用上一年同小时规律，再根据最近几周与历史同期的均值差异做趋势修正。",
+    MODEL_RIDGE: "使用小时、星期、月份、年度周期特征，以及 1 小时、24 小时、168 小时和 8760 小时滞后电价，通过岭回归学习规律。",
+    MODEL_ENSEMBLE: "根据历史回测误差自动优化多个基础模型的权重，综合得到最终预测结果。",
+}
 
 
 @dataclass
@@ -86,10 +97,10 @@ def train_validate_split(df: pd.DataFrame, validation_year: int) -> tuple[pd.Dat
 
 def forecast_all_models(train: pd.DataFrame, horizon: pd.DatetimeIndex) -> pd.DataFrame:
     forecasts = pd.DataFrame({"ds": horizon})
-    forecasts["Seasonal naive"] = seasonal_naive_forecast(train, horizon)
-    forecasts["Calendar profile"] = calendar_profile_forecast(train, horizon)
-    forecasts["Recent adjusted seasonal"] = recent_adjusted_seasonal_forecast(train, horizon)
-    forecasts["Ridge autoregression"] = ridge_autoregression_forecast(train, horizon)
+    forecasts[MODEL_SEASONAL_NAIVE] = seasonal_naive_forecast(train, horizon)
+    forecasts[MODEL_CALENDAR_PROFILE] = calendar_profile_forecast(train, horizon)
+    forecasts[MODEL_RECENT_ADJUSTED] = recent_adjusted_seasonal_forecast(train, horizon)
+    forecasts[MODEL_RIDGE] = ridge_autoregression_forecast(train, horizon)
     return forecasts
 
 
@@ -199,7 +210,7 @@ def run_backtests(df: pd.DataFrame) -> list[BacktestResult]:
         horizon = pd.DatetimeIndex(valid["ds"])
         predictions = forecast_all_models(train, horizon)
         weights = _fit_or_fallback_weights(prior_actuals, prior_predictions, predictions, valid["y"].to_numpy(dtype=float))
-        predictions["Optimized ensemble"] = _weighted_prediction(predictions, weights)
+        predictions[MODEL_ENSEMBLE] = _weighted_prediction(predictions, weights)
 
         metrics = _metrics_for_predictions(valid["y"].to_numpy(dtype=float), predictions)
         weight_frame = pd.DataFrame({"model": list(weights.keys()), "weight": list(weights.values())})
@@ -226,7 +237,7 @@ def forecast_future(df: pd.DataFrame, hours: int = HOURS_PER_YEAR) -> tuple[pd.D
     actuals = [result.predictions["y"].to_numpy(dtype=float) for result in backtests]
     preds = [result.predictions[["ds", *BASE_MODEL_NAMES]].copy() for result in backtests]
     weights = _fit_or_fallback_weights(actuals, preds, forecasts, None)
-    forecasts["Optimized ensemble"] = _weighted_prediction(forecasts, weights)
+    forecasts[MODEL_ENSEMBLE] = _weighted_prediction(forecasts, weights)
     weights_df = pd.DataFrame({"model": list(weights.keys()), "weight": list(weights.values())})
     return forecasts, weights_df
 
@@ -343,7 +354,7 @@ def _weighted_prediction(predictions: pd.DataFrame, weights: dict[str, float]) -
 
 def _metrics_for_predictions(y_true: np.ndarray, predictions: pd.DataFrame) -> pd.DataFrame:
     rows = []
-    for name in [*BASE_MODEL_NAMES, "Optimized ensemble"]:
+    for name in [*BASE_MODEL_NAMES, MODEL_ENSEMBLE]:
         pred = predictions[name].to_numpy(dtype=float)
         rows.append({"model": name, **calculate_metrics(y_true, pred)})
     return pd.DataFrame(rows).sort_values("RMSE").reset_index(drop=True)

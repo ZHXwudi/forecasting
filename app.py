@@ -9,6 +9,10 @@ import streamlit as st
 
 from forecasting import (
     HOURS_PER_YEAR,
+    MODEL_DESCRIPTIONS,
+    MODEL_ENSEMBLE,
+    MODEL_RIDGE,
+    MODEL_SEASONAL_NAIVE,
     describe_data,
     forecast_future,
     format_metric_table,
@@ -73,6 +77,15 @@ tabs = st.tabs(["模型对比", "回测曲线", "未来预测", "数据概览"])
 
 with tabs[0]:
     st.subheader("各模型预测准确率")
+    st.caption("下表先解释每个模型的含义，再用回测指标比较准确率。RMSE 和 MAE 越低越好，R2 越接近 1 越好。")
+    st.dataframe(
+        pd.DataFrame(
+            [{"模型": model_name, "中文解释": description} for model_name, description in MODEL_DESCRIPTIONS.items()]
+        ),
+        use_container_width=True,
+        hide_index=True,
+    )
+
     selected_year = st.selectbox(
         "验证年份",
         options=[result.validation_year for result in backtests],
@@ -108,12 +121,12 @@ with tabs[1]:
     chosen_models = st.multiselect(
         "显示模型",
         options=model_options,
-        default=["Optimized ensemble", "Ridge autoregression", "Seasonal naive"],
+        default=[MODEL_ENSEMBLE, MODEL_RIDGE, MODEL_SEASONAL_NAIVE],
     )
     plot_data = selected_result.predictions.tail(show_points)
 
     fig = go.Figure()
-    fig.add_trace(go.Scatter(x=plot_data["ds"], y=plot_data["y"], name="Actual", mode="lines"))
+    fig.add_trace(go.Scatter(x=plot_data["ds"], y=plot_data["y"], name="真实电价", mode="lines"))
     for model_name in chosen_models:
         fig.add_trace(go.Scatter(x=plot_data["ds"], y=plot_data[model_name], name=model_name, mode="lines"))
     fig.update_layout(xaxis_title="", yaxis_title="电价", hovermode="x unified")
@@ -124,13 +137,13 @@ with tabs[2]:
     forecast_model = st.selectbox(
         "预测曲线",
         options=[column for column in future.columns if column != "ds"],
-        index=list(future.columns).index("Optimized ensemble") - 1,
+        index=list(future.columns).index(MODEL_ENSEMBLE) - 1,
     )
-    recent = df.tail(min(show_points, len(df))).rename(columns={"y": "Actual"})
+    recent = df.tail(min(show_points, len(df))).rename(columns={"y": "真实电价"})
     future_plot = future.head(show_points)
 
     fig = go.Figure()
-    fig.add_trace(go.Scatter(x=recent["ds"], y=recent["Actual"], name="历史电价", mode="lines"))
+    fig.add_trace(go.Scatter(x=recent["ds"], y=recent["真实电价"], name="历史电价", mode="lines"))
     fig.add_trace(go.Scatter(x=future_plot["ds"], y=future_plot[forecast_model], name=forecast_model, mode="lines"))
     fig.update_layout(xaxis_title="", yaxis_title="电价", hovermode="x unified")
     st.plotly_chart(fig, use_container_width=True)

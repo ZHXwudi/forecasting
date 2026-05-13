@@ -1,5 +1,5 @@
 ﻿model,weight
-Seasonal naive,0.999999984316825
-Calendar profile,0.0
-Recent adjusted seasonal,1.5683174845967533e-08
-Ridge autoregression,0.0
+年度同小时基准模型,0.999999984316825
+日历画像中位数模型,0.0
+近期修正季节模型,1.5683174845967533e-08
+岭回归自回归模型,0.0
