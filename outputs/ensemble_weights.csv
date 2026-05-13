@@ -1,0 +1,5 @@
+﻿model,weight
+Seasonal naive,0.999999984316825
+Calendar profile,0.0
+Recent adjusted seasonal,1.5683174845967533e-08
+Ridge autoregression,0.0
