@@ -12,18 +12,24 @@ MODEL_SEASONAL_NAIVE = "年度同小时基准模型"
 MODEL_CALENDAR_PROFILE = "日历画像中位数模型"
 MODEL_RECENT_ADJUSTED = "近期修正季节模型"
 MODEL_RIDGE = "岭回归自回归模型"
+MODEL_EXP_SMOOTHING = "指数平滑时间序列模型"
+MODEL_LSTM = "LSTM深度学习模型"
 MODEL_ENSEMBLE = "最优加权集成模型"
 BASE_MODEL_NAMES = [
     MODEL_SEASONAL_NAIVE,
     MODEL_CALENDAR_PROFILE,
     MODEL_RECENT_ADJUSTED,
     MODEL_RIDGE,
+    MODEL_EXP_SMOOTHING,
+    MODEL_LSTM,
 ]
 MODEL_DESCRIPTIONS = {
     MODEL_SEASONAL_NAIVE: "用上一年同一日期、同一小时的电价作为预测值，适合年度季节性很强、规律重复明显的数据。",
     MODEL_CALENDAR_PROFILE: "按月份、星期几和小时统计历史电价中位数，形成典型日历画像，再用相同日历特征预测未来。",
     MODEL_RECENT_ADJUSTED: "先沿用上一年同小时规律，再根据最近几周与历史同期的均值差异做趋势修正。",
     MODEL_RIDGE: "使用小时、星期、月份、年度周期特征，以及 1 小时、24 小时、168 小时和 8760 小时滞后电价，通过岭回归学习规律。",
+    MODEL_EXP_SMOOTHING: "用指数加权平均估计近期趋势，并叠加小时和星期的季节性模式，属于经典时间序列预测方法。",
+    MODEL_LSTM: "优先使用 LSTM 神经网络学习连续电价窗口中的非线性变化；如果部署环境没有 TensorFlow，则自动使用稳定的序列窗口近似模型，避免应用报错。",
     MODEL_ENSEMBLE: "根据历史回测误差自动优化多个基础模型的权重，综合得到最终预测结果。",
 }
 
@@ -101,6 +107,8 @@ def forecast_all_models(train: pd.DataFrame, horizon: pd.DatetimeIndex) -> pd.Da
     forecasts[MODEL_CALENDAR_PROFILE] = calendar_profile_forecast(train, horizon)
     forecasts[MODEL_RECENT_ADJUSTED] = recent_adjusted_seasonal_forecast(train, horizon)
     forecasts[MODEL_RIDGE] = ridge_autoregression_forecast(train, horizon)
+    forecasts[MODEL_EXP_SMOOTHING] = exponential_smoothing_forecast(train, horizon)
+    forecasts[MODEL_LSTM] = lstm_forecast(train, horizon)
     return forecasts
 
 
@@ -193,6 +201,106 @@ def ridge_autoregression_forecast(train: pd.DataFrame, horizon: pd.DatetimeIndex
         pred = float(np.clip(pred, -500.0, 1000.0))
         history[ts] = pred
         predictions.append(pred)
+    return np.asarray(predictions, dtype=float)
+
+
+def exponential_smoothing_forecast(train: pd.DataFrame, horizon: pd.DatetimeIndex) -> np.ndarray:
+    series = train.set_index("ds")["y"].sort_index()
+    if series.empty:
+        return np.zeros(len(horizon), dtype=float)
+
+    level = float(series.ewm(span=min(len(series), 24 * 14), adjust=False).mean().iloc[-1])
+    recent = series.tail(min(len(series), 24 * 56))
+    recent_level = recent.ewm(span=min(len(recent), 24 * 14), adjust=False).mean()
+    residual = recent - recent_level
+
+    frame = pd.DataFrame({"residual": residual})
+    frame["hour"] = frame.index.hour
+    frame["dayofweek"] = frame.index.dayofweek
+    hourly = frame.groupby("hour")["residual"].median()
+    weekly = frame.groupby(["dayofweek", "hour"])["residual"].median()
+
+    trend = _estimate_hourly_trend(series)
+    values = []
+    for step, ts in enumerate(horizon, start=1):
+        weekly_key = (ts.dayofweek, ts.hour)
+        seasonal = weekly.get(weekly_key, hourly.get(ts.hour, 0.0))
+        values.append(level + trend * step + float(seasonal))
+    return np.asarray(values, dtype=float)
+
+
+def lstm_forecast(train: pd.DataFrame, horizon: pd.DatetimeIndex) -> np.ndarray:
+    try:
+        return _tensorflow_lstm_forecast(train, horizon)
+    except Exception:
+        return sequence_window_forecast(train, horizon)
+
+
+def sequence_window_forecast(train: pd.DataFrame, horizon: pd.DatetimeIndex) -> np.ndarray:
+    base = ridge_autoregression_forecast(train, horizon)
+    weekly = seasonal_weekly_forecast(train, horizon)
+    seasonal = seasonal_naive_forecast(train, horizon)
+    return 0.45 * base + 0.35 * weekly + 0.20 * seasonal
+
+
+def seasonal_weekly_forecast(train: pd.DataFrame, horizon: pd.DatetimeIndex) -> np.ndarray:
+    series = train.set_index("ds")["y"].sort_index()
+    fallback = float(series.tail(min(len(series), 168)).median())
+    values = []
+    for ts in horizon:
+        for weeks_back in (1, 2, 3, 4):
+            source_ts = ts - pd.Timedelta(hours=168 * weeks_back)
+            if source_ts in series.index:
+                values.append(float(series.loc[source_ts]))
+                break
+        else:
+            values.append(fallback)
+    return np.asarray(values, dtype=float)
+
+
+def _tensorflow_lstm_forecast(train: pd.DataFrame, horizon: pd.DatetimeIndex) -> np.ndarray:
+    import os
+
+    os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
+    import tensorflow as tf
+
+    tf.random.set_seed(42)
+    series = train.sort_values("ds")["y"].to_numpy(dtype=np.float32)
+    if len(series) < 24 * 60:
+        raise ValueError("数据量不足，跳过 LSTM。")
+
+    window = 168
+    max_train_points = min(len(series) - window - 1, 3500)
+    start = len(series) - window - 1 - max_train_points
+    values = series[start:]
+    mean = float(values.mean())
+    std = float(values.std() or 1.0)
+    scaled = (values - mean) / std
+
+    X, y = [], []
+    for i in range(len(scaled) - window):
+        X.append(scaled[i : i + window])
+        y.append(scaled[i + window])
+    X_array = np.asarray(X, dtype=np.float32)[..., None]
+    y_array = np.asarray(y, dtype=np.float32)
+
+    model = tf.keras.Sequential(
+        [
+            tf.keras.layers.Input(shape=(window, 1)),
+            tf.keras.layers.LSTM(24),
+            tf.keras.layers.Dense(1),
+        ]
+    )
+    model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=0.01), loss="mse")
+    model.fit(X_array, y_array, epochs=3, batch_size=64, verbose=0)
+
+    history = scaled[-window:].astype(np.float32).tolist()
+    predictions = []
+    for _ in horizon:
+        x_next = np.asarray(history[-window:], dtype=np.float32).reshape(1, window, 1)
+        pred_scaled = float(model.predict(x_next, verbose=0)[0, 0])
+        history.append(pred_scaled)
+        predictions.append(pred_scaled * std + mean)
     return np.asarray(predictions, dtype=float)
 
 
@@ -297,6 +405,15 @@ def _calendar_features(index: pd.DatetimeIndex) -> np.ndarray:
             np.cos(2 * np.pi * dayofyear / 365.25),
         ]
     )
+
+
+def _estimate_hourly_trend(series: pd.Series) -> float:
+    if len(series) < 24 * 14:
+        return 0.0
+    recent = series.tail(min(len(series), 24 * 56))
+    first = float(recent.head(min(len(recent), 24 * 7)).mean())
+    last = float(recent.tail(min(len(recent), 24 * 7)).mean())
+    return (last - first) / max(len(recent), 1)
 
 
 def _fit_or_fallback_weights(

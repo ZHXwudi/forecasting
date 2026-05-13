@@ -11,6 +11,7 @@ from forecasting import (
     HOURS_PER_YEAR,
     MODEL_DESCRIPTIONS,
     MODEL_ENSEMBLE,
+    MODEL_LSTM,
     MODEL_RIDGE,
     MODEL_SEASONAL_NAIVE,
     describe_data,
@@ -22,6 +23,7 @@ from forecasting import (
 
 
 st.set_page_config(page_title="国外电价预测模型", page_icon="⚡", layout="wide")
+CACHE_VERSION = "models_cn_lstm_ts_v3"
 
 
 @st.cache_data(show_spinner=False)
@@ -34,12 +36,12 @@ def cached_load(source_name: str, uploaded_bytes: bytes | None) -> pd.DataFrame:
 
 
 @st.cache_data(show_spinner=False)
-def cached_backtests(df: pd.DataFrame):
+def cached_backtests(df: pd.DataFrame, cache_version: str):
     return run_backtests(df)
 
 
 @st.cache_data(show_spinner=False)
-def cached_future(df: pd.DataFrame, hours: int):
+def cached_future(df: pd.DataFrame, hours: int, cache_version: str):
     return forecast_future(df, hours)
 
 
@@ -57,8 +59,8 @@ with st.sidebar:
 try:
     with st.spinner("正在清洗数据并训练模型..."):
         df = cached_load(source_name, uploaded_bytes)
-        backtests = cached_backtests(df)
-        future, future_weights = cached_future(df, forecast_days * 24)
+        backtests = cached_backtests(df, CACHE_VERSION)
+        future, future_weights = cached_future(df, forecast_days * 24, CACHE_VERSION)
 except Exception as exc:
     st.error(f"运行失败：{exc}")
     st.stop()
@@ -118,10 +120,15 @@ with tabs[0]:
 with tabs[1]:
     st.subheader("验证集真实值与预测值")
     model_options = [column for column in selected_result.predictions.columns if column not in {"ds", "y", "validation_year"}]
+    preferred_models = [MODEL_ENSEMBLE, MODEL_LSTM, MODEL_RIDGE, MODEL_SEASONAL_NAIVE]
+    default_models = [model for model in preferred_models if model in model_options]
+    if not default_models:
+        default_models = model_options[: min(3, len(model_options))]
     chosen_models = st.multiselect(
         "显示模型",
         options=model_options,
-        default=[MODEL_ENSEMBLE, MODEL_RIDGE, MODEL_SEASONAL_NAIVE],
+        default=default_models,
+        key="backtest_model_select_v3",
     )
     plot_data = selected_result.predictions.tail(show_points)
 
@@ -134,10 +141,16 @@ with tabs[1]:
 
 with tabs[2]:
     st.subheader("未来电价预测")
+    future_model_options = [column for column in future.columns if column != "ds"]
+    if not future_model_options:
+        st.error("未来预测结果中没有可展示的模型列，请重新运行预测。")
+        st.stop()
+    default_future_index = future_model_options.index(MODEL_ENSEMBLE) if MODEL_ENSEMBLE in future_model_options else 0
     forecast_model = st.selectbox(
         "预测曲线",
-        options=[column for column in future.columns if column != "ds"],
-        index=list(future.columns).index(MODEL_ENSEMBLE) - 1,
+        options=future_model_options,
+        index=default_future_index,
+        key="future_model_select_v3",
     )
     recent = df.tail(min(show_points, len(df))).rename(columns={"y": "真实电价"})
     future_plot = future.head(show_points)
