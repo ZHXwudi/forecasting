@@ -7,7 +7,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 
-from forecasting import (
+from forecasting_core import (
     HOURS_PER_YEAR,
     MODEL_ENSEMBLE,
     MODEL_LSTM,

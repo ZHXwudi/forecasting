@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import argparse
 
-from forecasting import HOURS_PER_YEAR, load_price_data, save_outputs
+from forecasting_core import HOURS_PER_YEAR, load_price_data, save_outputs
 
 
 def main() -> None:
