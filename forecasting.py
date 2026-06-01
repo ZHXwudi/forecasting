@@ -8,13 +8,26 @@ import pandas as pd
 
 
 HOURS_PER_YEAR = 8760
-MODEL_SEASONAL_NAIVE = "年度同小时基准模型"
-MODEL_CALENDAR_PROFILE = "日历画像中位数模型"
-MODEL_RECENT_ADJUSTED = "近期修正季节模型"
-MODEL_RIDGE = "岭回归自回归模型"
-MODEL_EXP_SMOOTHING = "指数平滑时间序列模型"
-MODEL_LSTM = "LSTM深度学习模型"
-MODEL_ENSEMBLE = "最优加权集成模型"
+
+
+@dataclass(frozen=True)
+class ModelProfile:
+    english_name: str
+    short_name_cn: str
+    description: str
+
+
+def _model_label(english_name: str, short_name_cn: str) -> str:
+    return f"{english_name} ({short_name_cn})"
+
+
+MODEL_SEASONAL_NAIVE = _model_label("Seasonal Naive", "同小时")
+MODEL_CALENDAR_PROFILE = _model_label("Calendar Profile", "画像")
+MODEL_RECENT_ADJUSTED = _model_label("Recent Seasonal Adjustment", "修正")
+MODEL_RIDGE = _model_label("Ridge Autoregression", "岭回归")
+MODEL_EXP_SMOOTHING = _model_label("Exponential Smoothing", "平滑")
+MODEL_LSTM = _model_label("LSTM", "深度学习")
+MODEL_ENSEMBLE = _model_label("Weighted Ensemble", "集成")
 BASE_MODEL_NAMES = [
     MODEL_SEASONAL_NAIVE,
     MODEL_CALENDAR_PROFILE,
@@ -23,15 +36,45 @@ BASE_MODEL_NAMES = [
     MODEL_EXP_SMOOTHING,
     MODEL_LSTM,
 ]
-MODEL_DESCRIPTIONS = {
-    MODEL_SEASONAL_NAIVE: "用上一年同一日期、同一小时的电价作为预测值，适合年度季节性很强、规律重复明显的数据。",
-    MODEL_CALENDAR_PROFILE: "按月份、星期几和小时统计历史电价中位数，形成典型日历画像，再用相同日历特征预测未来。",
-    MODEL_RECENT_ADJUSTED: "先沿用上一年同小时规律，再根据最近几周与历史同期的均值差异做趋势修正。",
-    MODEL_RIDGE: "使用小时、星期、月份、年度周期特征，以及 1 小时、24 小时、168 小时和 8760 小时滞后电价，通过岭回归学习规律。",
-    MODEL_EXP_SMOOTHING: "用指数加权平均估计近期趋势，并叠加小时和星期的季节性模式，属于经典时间序列预测方法。",
-    MODEL_LSTM: "优先使用 LSTM 神经网络学习连续电价窗口中的非线性变化；如果部署环境没有 TensorFlow，则自动使用稳定的序列窗口近似模型，避免应用报错。",
-    MODEL_ENSEMBLE: "根据历史回测误差自动优化多个基础模型的权重，综合得到最终预测结果。",
+MODEL_DISPLAY_ORDER = [*BASE_MODEL_NAMES, MODEL_ENSEMBLE]
+MODEL_METADATA = {
+    MODEL_SEASONAL_NAIVE: ModelProfile(
+        english_name="Seasonal Naive",
+        short_name_cn="同小时",
+        description="用上一年同一日期、同一小时的电价作为预测值，适合年度季节性很强、规律重复明显的数据。",
+    ),
+    MODEL_CALENDAR_PROFILE: ModelProfile(
+        english_name="Calendar Profile",
+        short_name_cn="画像",
+        description="按月份、星期几和小时统计历史电价中位数，形成典型日历画像，再用相同日历特征预测未来。",
+    ),
+    MODEL_RECENT_ADJUSTED: ModelProfile(
+        english_name="Recent Seasonal Adjustment",
+        short_name_cn="修正",
+        description="先沿用上一年同小时规律，再根据最近几周与历史同期的均值差异做趋势修正。",
+    ),
+    MODEL_RIDGE: ModelProfile(
+        english_name="Ridge Autoregression",
+        short_name_cn="岭回归",
+        description="使用小时、星期、月份、年度周期特征，以及 1 小时、24 小时、168 小时和 8760 小时滞后电价，通过岭回归学习规律。",
+    ),
+    MODEL_EXP_SMOOTHING: ModelProfile(
+        english_name="Exponential Smoothing",
+        short_name_cn="平滑",
+        description="用指数加权平均估计近期趋势，并叠加小时和星期的季节性模式，属于经典时间序列预测方法。",
+    ),
+    MODEL_LSTM: ModelProfile(
+        english_name="LSTM",
+        short_name_cn="深度学习",
+        description="优先使用 LSTM 神经网络学习连续电价窗口中的非线性变化；如果部署环境没有 TensorFlow，则自动使用稳定的序列窗口近似模型，避免应用报错。",
+    ),
+    MODEL_ENSEMBLE: ModelProfile(
+        english_name="Weighted Ensemble",
+        short_name_cn="集成",
+        description="根据历史回测误差自动优化多个基础模型的权重，综合得到最终预测结果。",
+    ),
 }
+MODEL_DESCRIPTIONS = {model_name: profile.description for model_name, profile in MODEL_METADATA.items()}
 
 
 @dataclass
@@ -40,6 +83,21 @@ class BacktestResult:
     metrics: pd.DataFrame
     predictions: pd.DataFrame
     ensemble_weights: pd.DataFrame
+
+
+def build_model_catalog() -> pd.DataFrame:
+    rows = []
+    for model_name in MODEL_DISPLAY_ORDER:
+        profile = MODEL_METADATA[model_name]
+        rows.append(
+            {
+                "模型标识": model_name,
+                "英文主标识": profile.english_name,
+                "中文简写": profile.short_name_cn,
+                "说明": profile.description,
+            }
+        )
+    return pd.DataFrame(rows)
 
 
 def load_price_data(source: str | Path | object) -> pd.DataFrame:
