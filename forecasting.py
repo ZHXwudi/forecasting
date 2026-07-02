@@ -102,8 +102,10 @@ def build_model_catalog() -> pd.DataFrame:
 
 def load_price_data(source: str | Path | object) -> pd.DataFrame:
     """Load a CSV with Chinese or generic date/time/price columns."""
-    raw = pd.read_csv(source)
-    raw = raw.dropna(how="all").copy()
+    raw_input = pd.read_csv(source)
+    raw_rows = int(len(raw_input))
+    all_empty_rows = int(raw_input.isna().all(axis=1).sum())
+    raw = raw_input.dropna(how="all").copy()
     if raw.empty:
         raise ValueError("CSV 文件没有可用数据。")
 
@@ -115,16 +117,47 @@ def load_price_data(source: str | Path | object) -> pd.DataFrame:
     dt_text = raw[date_col].astype(str).str.strip() + " " + raw[time_col].astype(str).str.strip()
     parsed = pd.to_datetime(dt_text, dayfirst=True, errors="coerce")
     price = pd.to_numeric(raw[price_col], errors="coerce")
+    invalid_time_rows = int(parsed.isna().sum())
+    missing_price_rows = int(price.isna().sum())
 
-    df = pd.DataFrame({"ds": parsed, "y": price})
-    df = df.dropna(subset=["ds", "y"]).sort_values("ds")
+    parsed_frame = pd.DataFrame({"ds": parsed, "y": price})
+    df = parsed_frame.dropna(subset=["ds", "y"]).sort_values("ds")
+    valid_rows = int(len(df))
+    duplicate_rows = int(df.duplicated(subset=["ds"]).sum())
     df = df.drop_duplicates(subset=["ds"], keep="last")
     if df.empty:
         raise ValueError("没有成功解析出日期时间和电价，请检查 CSV 列。")
 
-    df = df.set_index("ds").asfreq("h")
-    df["y"] = df["y"].interpolate("time").ffill().bfill()
-    df = df.reset_index()
+    hourly = df.set_index("ds").asfreq("h")
+    missing_mask = hourly["y"].isna()
+    interpolated_hours = int(missing_mask.sum())
+    if interpolated_hours:
+        interpolated_by_year = {
+            int(year): int(count)
+            for year, count in missing_mask[missing_mask].groupby(missing_mask[missing_mask].index.year).size().items()
+        }
+    else:
+        interpolated_by_year = {}
+    hourly["y"] = hourly["y"].interpolate("time").ffill().bfill()
+    df = hourly.reset_index()
+    df.attrs["quality"] = {
+        "raw_rows": raw_rows,
+        "all_empty_rows": all_empty_rows,
+        "non_empty_rows": int(len(raw)),
+        "valid_rows": valid_rows,
+        "invalid_time_rows": invalid_time_rows,
+        "missing_price_rows": missing_price_rows,
+        "duplicate_rows": duplicate_rows,
+        "interpolated_hours": interpolated_hours,
+        "interpolated_hours_by_year": interpolated_by_year,
+        "message": (
+            f"原始表格 {raw_rows} 行，其中全空行 {all_empty_rows} 行；"
+            f"成功解析有效电价 {valid_rows} 行，重复小时 {duplicate_rows} 行；"
+            f"无法解析时间 {invalid_time_rows} 行未进入建模；"
+            f"缺失/不可解析电价 {missing_price_rows} 行和断点小时统一按小时频率补齐，"
+            f"共插值/填充 {interpolated_hours} 小时。"
+        ),
+    }
     return df
 
 
@@ -138,7 +171,62 @@ def describe_data(df: pd.DataFrame) -> dict[str, object]:
         "min_price": float(df["y"].min()),
         "max_price": float(df["y"].max()),
         "mean_price": float(df["y"].mean()),
+        "quality": dict(df.attrs.get("quality", {})),
     }
+
+
+def build_yearly_summary(df: pd.DataFrame) -> pd.DataFrame:
+    quality = df.attrs.get("quality", {})
+    interpolated_by_year = quality.get("interpolated_hours_by_year", {})
+    yearly = (
+        df.assign(year=df["ds"].dt.year)
+        .groupby("year")["y"]
+        .agg(["count", "mean", "min", "max"])
+        .reset_index()
+        .rename(
+            columns={
+                "year": "年份",
+                "count": "小时数",
+                "mean": "平均电价",
+                "min": "最低电价",
+                "max": "最高电价",
+            }
+        )
+    )
+    yearly["插值补齐小时"] = yearly["年份"].map(
+        lambda year: int(interpolated_by_year.get(int(year), interpolated_by_year.get(str(year), 0)))
+    )
+    return yearly
+
+
+def detect_repeated_year_patterns(df: pd.DataFrame, tolerance: float = 1e-9) -> pd.DataFrame:
+    work = df[["ds", "y"]].copy()
+    work["year"] = work["ds"].dt.year
+    work["month"] = work["ds"].dt.month
+    work["day"] = work["ds"].dt.day
+    work["hour"] = work["ds"].dt.hour
+    work = work[~((work["month"] == 2) & (work["day"] == 29))]
+    pivot = work.pivot_table(index=["month", "day", "hour"], columns="year", values="y", aggfunc="first")
+    years = sorted(int(year) for year in pivot.columns)
+    rows = []
+    for left_index, left_year in enumerate(years):
+        for right_year in years[left_index + 1 :]:
+            pair = pivot[[left_year, right_year]].dropna()
+            if pair.empty:
+                continue
+            diff = (pair[left_year] - pair[right_year]).abs()
+            same_count = int((diff <= tolerance).sum())
+            rows.append(
+                {
+                    "年份对": f"{left_year} vs {right_year}",
+                    "共同小时点": int(len(pair)),
+                    "相同小时点": same_count,
+                    "重复率": float(same_count / len(pair)),
+                    "最大绝对差": float(diff.max()),
+                    "是否疑似重复": bool(same_count / len(pair) >= 0.995),
+                }
+            )
+    return pd.DataFrame(rows)
 
 
 def make_future_index(last_timestamp: pd.Timestamp, hours: int) -> pd.DatetimeIndex:
@@ -553,10 +641,34 @@ def calculate_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict[str, float
 
 
 def format_metric_table(metrics: pd.DataFrame) -> pd.DataFrame:
-    table = metrics.copy()
+    raw = metrics.copy()
+    table = raw.copy()
     for column in ["MAE", "RMSE"]:
         table[column] = table[column].map(lambda value: round(value, 3))
     for column in ["WMAPE", "sMAPE"]:
         table[column] = table[column].map(lambda value: round(value * 100, 2))
-    table["R2"] = table["R2"].map(lambda value: round(value, 4))
+    table["R2"] = raw["R2"].map(_format_r2)
+    notes = raw.apply(_metric_note, axis=1)
+    if notes.astype(bool).any():
+        table["备注"] = notes
     return table
+
+
+def _format_r2(value: float) -> str:
+    if pd.isna(value):
+        return ""
+    formatted = f"{float(value):.8f}"
+    if formatted == "1.00000000" and float(value) < 1.0:
+        return "<1.00000000"
+    return formatted
+
+
+def _metric_note(row: pd.Series) -> str:
+    r2 = float(row["R2"])
+    mae = float(row["MAE"])
+    rmse = float(row["RMSE"])
+    if np.isfinite(r2) and r2 >= 1.0 and mae <= 1e-12 and rmse <= 1e-12:
+        return "预测与验证值完全重合，请检查年度重复或数据泄漏"
+    if np.isfinite(r2) and r2 > 0.9999:
+        return "R2 接近 1，需结合 RMSE/MAE 判断"
+    return ""

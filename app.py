@@ -14,7 +14,9 @@ from forecasting_core import (
     MODEL_RIDGE,
     MODEL_SEASONAL_NAIVE,
     build_model_catalog,
+    build_yearly_summary,
     describe_data,
+    detect_repeated_year_patterns,
     forecast_future,
     format_metric_table,
     load_price_data,
@@ -23,11 +25,11 @@ from forecasting_core import (
 
 
 st.set_page_config(page_title="国外电价预测模型", page_icon="⚡", layout="wide")
-CACHE_VERSION = "models_en_cn_intro_v4"
+CACHE_VERSION = "data_quality_r2_v1"
 
 
 @st.cache_data(show_spinner=False)
-def cached_load(source_name: str, uploaded_bytes: bytes | None) -> pd.DataFrame:
+def cached_load(source_name: str, uploaded_bytes: bytes | None, cache_version: str) -> pd.DataFrame:
     if uploaded_bytes is None:
         return load_price_data(source_name)
     from io import BytesIO
@@ -167,7 +169,7 @@ def render_forecast_page() -> None:
 
     try:
         with st.spinner("正在清洗数据并训练模型..."):
-            df = cached_load(source_name, uploaded_bytes)
+            df = cached_load(source_name, uploaded_bytes, CACHE_VERSION)
             backtests = cached_backtests(df, CACHE_VERSION)
             future, future_weights = cached_future(df, forecast_days * 24, CACHE_VERSION)
     except Exception as exc:
@@ -175,6 +177,10 @@ def render_forecast_page() -> None:
         st.stop()
 
     summary = describe_data(df)
+    repeated_years = detect_repeated_year_patterns(df)
+    repeated_year_labels = []
+    if not repeated_years.empty:
+        repeated_year_labels = repeated_years.loc[repeated_years["是否疑似重复"], "年份对"].tolist()
     latest_backtest = backtests[-1]
     best_row = latest_backtest.metrics.iloc[0]
 
@@ -188,7 +194,7 @@ def render_forecast_page() -> None:
 
     with tabs[0]:
         st.subheader("各模型预测准确率")
-        st.caption("模型标识采用英文主名称，并在括号中保留中文简写。RMSE 和 MAE 越低越好，R2 越接近 1 越好。")
+        st.caption("模型标识采用英文主名称，并在括号中保留中文简写。RMSE 和 MAE 越低越好，R2 越接近 1 越好；R2 保留 8 位，避免接近 1 的值被四舍五入成 1。")
         st.dataframe(build_model_catalog(), use_container_width=True, hide_index=True)
 
         selected_year = st.selectbox(
@@ -199,6 +205,14 @@ def render_forecast_page() -> None:
         selected_result = next(result for result in backtests if result.validation_year == selected_year)
 
         metrics = prettify_metrics(selected_result.metrics)
+        exact_rows = selected_result.metrics[(selected_result.metrics["R2"] >= 1.0) & (selected_result.metrics["RMSE"] <= 1e-12)]
+        near_one_rows = selected_result.metrics[(selected_result.metrics["R2"] > 0.9999) & (selected_result.metrics["RMSE"] > 1e-12)]
+        if not exact_rows.empty:
+            st.warning("当前验证集中存在 RMSE=0、R2=1 的完美重合结果，通常意味着验证年份与历史年份存在重复或数据泄漏，需要优先检查数据来源。")
+        elif not near_one_rows.empty:
+            st.info("当前验证集中有模型 R2 非常接近 1。页面已提高显示精度，请同时查看 RMSE、MAE 判断误差是否真实为 0。")
+        if repeated_year_labels:
+            st.warning(f"检测到年度电价曲线高度重复：{', '.join(repeated_year_labels)}。同小时模型和集成模型的回测指标可能被显著抬高。")
         st.dataframe(metrics, use_container_width=True, hide_index=True)
 
         metric_chart = selected_result.metrics.sort_values("RMSE")
@@ -287,8 +301,30 @@ def render_forecast_page() -> None:
         overview_cols[1].metric("平均电价", f"{summary['mean_price']:.2f}")
         overview_cols[2].metric("最高电价", f"{summary['max_price']:.2f}")
 
-        yearly = df.assign(year=df["ds"].dt.year).groupby("year")["y"].agg(["count", "mean", "min", "max"]).reset_index()
+        quality = summary.get("quality", {})
+        if quality:
+            st.caption("清洗策略：全空行删除；无法解析时间的行不进入建模；缺失电价、缺失小时和闰年断点按小时频率补齐后使用时间插值，并用前后向填充处理边界。")
+            quality_rows = [
+                {"项目": "原始行数", "数量": quality.get("raw_rows", 0), "处理方式": "用于质量统计"},
+                {"项目": "全空行", "数量": quality.get("all_empty_rows", 0), "处理方式": "删除"},
+                {"项目": "成功解析有效电价", "数量": quality.get("valid_rows", 0), "处理方式": "进入建模"},
+                {"项目": "无法解析时间", "数量": quality.get("invalid_time_rows", 0), "处理方式": "不进入建模"},
+                {"项目": "缺失/不可解析电价", "数量": quality.get("missing_price_rows", 0), "处理方式": "补齐后插值"},
+                {"项目": "重复小时", "数量": quality.get("duplicate_rows", 0), "处理方式": "保留最后一条"},
+                {"项目": "插值/填充小时", "数量": quality.get("interpolated_hours", 0), "处理方式": "时间插值 + 前后向填充"},
+            ]
+            st.dataframe(pd.DataFrame(quality_rows), use_container_width=True, hide_index=True)
+
+        yearly = build_yearly_summary(df)
         st.dataframe(yearly, use_container_width=True, hide_index=True)
+
+        if not repeated_years.empty:
+            repeated_display = repeated_years.copy()
+            repeated_display["重复率"] = repeated_display["重复率"].map(lambda value: f"{value * 100:.2f}%")
+            repeated_display["最大绝对差"] = repeated_display["最大绝对差"].map(lambda value: round(value, 6))
+            if repeated_year_labels:
+                st.warning(f"年度重复检查发现疑似重复年份：{', '.join(repeated_year_labels)}。这些重复会让按上一年同小时取值的模型出现 R2=1 或近似 1。")
+            st.dataframe(repeated_display, use_container_width=True, hide_index=True)
 
         history = df.tail(min(HOURS_PER_YEAR, len(df)))
         fig = px.line(history, x="ds", y="y", title="最近一年历史电价")
